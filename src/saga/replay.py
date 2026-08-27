@@ -4,6 +4,16 @@ No clocks, no randomness, no I/O -- the same byte stream always folds to the
 identical snapshot. That is what makes this the single source of truth for
 the live engine, the CLI inspector, and the crash-injection sweep alike.
 
+``fold`` is built from two smaller pieces that are public in their own
+right, because :mod:`saga.engine` needs them too: :func:`workflow_started`
+builds the initial snapshot from a journal's first record, and :func:`apply`
+folds one subsequent record into an existing snapshot. The live engine calls
+these same two functions -- after every ``journal.append`` and *before*
+running any handler, per the write-ahead rule -- to maintain its in-memory
+snapshot. Sharing the exact function is what guarantees the engine's live
+snapshot and ``fold(all_records)`` can never drift apart; it is not two
+implementations kept in sync by hand.
+
 Every record type maps to at most one state-machine mutation, per the
 payload contract documented in :mod:`saga.records`. Two kinds of "clean,
 explicit error" can come out of a bad record stream, and they are
@@ -36,38 +46,43 @@ def fold(records: Iterable[JournalRecord]) -> WorkflowSnapshot:
     inconsistent; see the module docstring for how that's reported.
     """
     snapshot: WorkflowSnapshot | None = None
-    expected_lsn = 1
 
     for record in records:
-        if record.lsn != expected_lsn:
-            raise JournalCorruption(f"lsn gap: expected {expected_lsn}, got {record.lsn}")
-        expected_lsn += 1
-
-        if record.type is RecordType.WORKFLOW_STARTED:
-            if snapshot is not None:
-                raise JournalCorruption(f"duplicate WORKFLOW_STARTED at lsn={record.lsn}")
-            snapshot = _workflow_started(record)
-            continue
-
         if snapshot is None:
-            raise JournalCorruption(
-                f"journal must open with WORKFLOW_STARTED, got {record.type} at lsn={record.lsn}"
-            )
-        if record.epoch < snapshot.epoch:
-            raise JournalCorruption(
-                f"epoch went backwards: {snapshot.epoch} -> {record.epoch} at lsn={record.lsn}"
-            )
-        snapshot.epoch = record.epoch
-        snapshot.last_lsn = record.lsn
-
-        _HANDLERS[record.type](snapshot, record)
+            if record.type is not RecordType.WORKFLOW_STARTED:
+                raise JournalCorruption(
+                    f"journal must open with WORKFLOW_STARTED, got {record.type} at lsn={record.lsn}"
+                )
+            if record.lsn != 1:
+                raise JournalCorruption(f"WORKFLOW_STARTED must be lsn=1, got {record.lsn}")
+            snapshot = workflow_started(record)
+            continue
+        apply(snapshot, record)
 
     if snapshot is None:
         raise JournalCorruption("empty journal: no WORKFLOW_STARTED record")
     return snapshot
 
 
-def _workflow_started(record: JournalRecord) -> WorkflowSnapshot:
+def apply(snapshot: WorkflowSnapshot, record: JournalRecord) -> None:
+    """Fold one non-``WORKFLOW_STARTED`` record into an existing snapshot,
+    in place. ``record`` must be the immediate successor of whatever
+    ``snapshot.last_lsn`` currently is.
+    """
+    if record.type is RecordType.WORKFLOW_STARTED:
+        raise JournalCorruption(f"WORKFLOW_STARTED may only be the first record, got another at lsn={record.lsn}")
+    expected_lsn = snapshot.last_lsn + 1
+    if record.lsn != expected_lsn:
+        raise JournalCorruption(f"lsn gap: expected {expected_lsn}, got {record.lsn}")
+    if record.epoch < snapshot.epoch:
+        raise JournalCorruption(f"epoch went backwards: {snapshot.epoch} -> {record.epoch} at lsn={record.lsn}")
+    snapshot.epoch = record.epoch
+    snapshot.last_lsn = record.lsn
+    _HANDLERS[record.type](snapshot, record)
+
+
+def workflow_started(record: JournalRecord) -> WorkflowSnapshot:
+    """Build the initial snapshot from a journal's first record."""
     step_ids = record.payload.get("step_ids")
     if not isinstance(step_ids, list) or not all(isinstance(s, str) for s in step_ids):
         raise JournalCorruption(

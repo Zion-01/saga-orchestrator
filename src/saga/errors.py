@@ -74,3 +74,21 @@ class StepFailure(SagaError):
         super().__init__(f"step {step_id!r} failed: {cause!r}")
         self.step_id = step_id
         self.cause = cause
+
+
+class WorkflowFailed(SagaError):
+    """Forward execution stopped without reaching ``WORKFLOW_COMPLETED``.
+
+    Raised by ``Orchestrator.run()`` once a step exhausts its retry budget,
+    times out, or comes back ``UNCERTAIN``. There is no compensation engine
+    until phase 4, so this is not a rollback failure -- it just means
+    forward progress cannot continue. The journal is left exactly as
+    durably written: the failed/uncertain step's own terminal record is on
+    disk, but the workflow itself is left ``RUNNING``, unresolved, for a
+    later phase (or a human) to pick up.
+    """
+
+    def __init__(self, step_id: str, cause: BaseException | None = None) -> None:
+        super().__init__(f"step {step_id!r} did not complete: {cause!r}")
+        self.step_id = step_id
+        self.cause = cause
