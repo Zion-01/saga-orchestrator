@@ -63,44 +63,63 @@ detectable, and mechanically recoverable — never guessed at.
 
 ## Status
 
-This is a from-scratch build, progressing in five phases. See
+This is a from-scratch build, delivered in five phases. See
 [CLAUDE.md](CLAUDE.md) for the full architectural plan (data models, state
 diagrams, edge-case strategy, and the verification plan in detail).
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Foundations (no I/O): state machine, data models, DAG validation | ✅ Done |
-| 2 | Durable journal: append/fsync writer, CRC-verifying reader, pure replay fold | ⏳ Not started |
-| 3 | Forward engine: `asyncio.TaskGroup` scheduling, retries, timeouts | ⏳ Not started |
-| 4 | Compensation, cancellation, poison pills, dead-letter manifest | ⏳ Not started |
-| 5 | Recovery, zombie resolution, CLI inspector | ⏳ Not started |
+| 2 | Durable journal: append/fsync writer, CRC-verifying reader, pure replay fold | ✅ Done |
+| 3 | Forward engine: `asyncio.TaskGroup` scheduling, retries, timeouts | ✅ Done |
+| 4 | Compensation, cancellation, poison pills, dead-letter manifest | ✅ Done |
+| 5 | Recovery, zombie resolution, CLI inspector | ✅ Done |
 
-**Phase 1 exit criterion (met):** the state machine is enforceable — every
-transition, including ones replayed from a journal, is checked against a
-declared transition table and raises loudly on violation — and the DAG
-validator rejects cycles, dangling `depends_on` references, and duplicate
-step ids.
+All five phases are complete. The full suite (`python -m pytest -q`) passes,
+including the exhaustive crash-injection sweep described under
+[Development](#development).
+
+**Phase 5 exit criterion (met):** `recover(journal_file, spec)` folds a
+journal left by a killed process and resumes it — walking the zombie ladder
+for every in-flight step, then either finishing the forward DAG or finishing
+rollback — to a terminal state, for a process killed at *every* LSN of the
+example saga, with no double execution, no orphaned side effects, and a
+recovered snapshot byte-identical to `replay.fold(all_records)`.
 
 ## Project layout
 
 ```
 src/saga/
+├── __init__.py     # public surface: Orchestrator, Step, WorkflowSpec, Journal, recover, ...
 ├── states.py       # StepState / WorkflowState enums + legal-transition tables
 ├── models.py       # Step, WorkflowSpec, StepRuntime, WorkflowSnapshot, ProbeResult
 ├── errors.py       # TransientError, PermanentError, UncertainOutcome, IllegalTransition, ...
 ├── idempotency.py  # deterministic key derivation: (workflow_id, step_id, attempt) -> key
 ├── dag.py          # cycle detection, dependency closure, topological/reverse-topo ordering
 ├── retry.py        # RetryPolicy (bounded backoff) + error classification
-├── journal.py      # [phase 2] append+fsync writer, replaying reader, torn-tail repair
-├── replay.py       # [phase 2] fold(records) -> WorkflowSnapshot, pure, no I/O
-├── engine.py        # [phase 3/4] Orchestrator: forward run, cancellation, compensation
-├── recovery.py      # [phase 5] recover(journal_file) -> resumable Orchestrator
-├── manifest.py      # [phase 4] InterventionManifest builder + writer
-├── lockfile.py       # [phase 2] single-writer guard per journal
-└── cli.py            # [phase 5] `saga inspect|verify|replay|manifest|graph`
+├── journal.py      # append+fsync writer, replaying reader, torn-tail repair, crash injection
+├── replay.py       # fold(records) -> WorkflowSnapshot, pure, no I/O
+├── engine.py       # Orchestrator: forward run, cancellation, compensation, resume
+├── recovery.py     # recover(journal_file, spec) -> resumable Orchestrator
+├── manifest.py     # InterventionManifest builder + writer
+├── lockfile.py     # single-writer guard per journal
+└── cli.py          # `saga inspect|verify|replay|manifest|graph`
+examples/
+├── booking_saga.py # flight -> hotel -> car; car fails permanently -> full rollback
+└── poison_pill.py  # a refund compensator that returns HTTP 400 forever -> DEAD_LETTER
 tests/
-├── test_dag.py     # cycle/dangling-dep/duplicate-id rejection, ordering determinism
-└── test_states.py  # exhaustive legal/illegal transition matrix
+├── test_dag.py            # cycle/dangling-dep/duplicate-id rejection, ordering determinism
+├── test_states.py         # exhaustive legal/illegal transition matrix
+├── test_journal.py        # CRC corruption, torn tail, fsync-before-return ordering
+├── test_replay.py         # fold determinism and totality
+├── test_engine_forward.py # concurrent diamond DAG, retries, timeouts, live == fold
+├── test_compensation.py   # reverse-order rollback, partial rollback
+├── test_cancellation.py   # sibling-failure cancellation ceremony, grace period, shielding
+├── test_poison_pill.py    # DEAD_LETTER, quarantine, manifest contents
+├── test_zombie.py         # probe FOUND / NOT_FOUND / UNKNOWN + no-probe replay
+├── test_recovery.py       # resume-forward and resume-rollback from truncated journals
+├── test_cli.py            # every `saga` subcommand
+└── test_crash_sweep.py    # kill-at-every-LSN recovery sweep (the load-bearing test)
 ```
 
 ## Core concepts
@@ -190,6 +209,75 @@ raises `IllegalTransition` on anything not in the table. This means a
 corrupt or hand-edited journal fails loudly at recovery instead of silently
 reconstructing a state machine that never legally existed.
 
+## Using it
+
+### Run a workflow
+
+```python
+import asyncio
+from saga import Orchestrator, Step, WorkflowSpec, Journal, WorkflowFailed
+
+async def book_flight(ctx):  return {"pnr": "AB123"}
+async def cancel_flight(ctx, result): ...        # compensator: async (ctx, result) -> None
+
+spec = WorkflowSpec.of("booking-7a1", [
+    Step(id="flight", handler=book_flight, compensate=cancel_flight),
+    # ... more steps, wired with depends_on=frozenset({...})
+])
+
+async def main():
+    with Journal.open_for_write("booking.journal") as journal:
+        orch = Orchestrator(spec, journal)
+        try:
+            snapshot = await orch.run()          # -> WorkflowState.COMPLETED
+        except WorkflowFailed:
+            snapshot = orch.snapshot             # rollback already ran: COMPENSATED or DEAD_LETTER
+
+asyncio.run(main())
+```
+
+`workflow_id` is caller-supplied and the journal is one file per workflow.
+The `Orchestrator` is one-shot; `run()` journals-then-fsyncs every transition
+before it touches memory or calls your code.
+
+### Recover after a crash
+
+If the process is killed at any instant, hand the same journal and spec to
+`recover()`. It folds the journal, walks the zombie ladder for every step
+that was in flight (calling `Step.probe` where you supplied one, otherwise
+replaying the handler under the *identical* idempotency key), and drives the
+workflow to a terminal state — resuming the forward DAG or resuming rollback
+as the journal dictates.
+
+```python
+from saga import recover
+
+orch = recover("booking.journal", spec)   # opens the journal, bumps the epoch
+try:
+    snapshot = await orch.run()           # resume; does NOT raise WorkflowFailed
+finally:
+    orch.close()                          # recover() owns the journal it opened
+```
+
+`recover()` clears the stale single-writer lock left by the dead process by
+default (pass `break_stale_lock=False` if the original writer might still be
+alive). Handlers, compensators and probes are code, so the spec must be
+supplied; `recover()` checks its `workflow_id` and step ids match the journal
+and raises `SpecMismatch` otherwise.
+
+### Inspect a journal from the shell
+
+```
+saga inspect  booking.journal   # status + per-step state; flags zombies and the key to probe
+saga verify   booking.journal   # CRC + framing + LSN-continuity check; names any bad LSN
+saga replay   booking.journal   # fold to a WorkflowSnapshot, print as JSON
+saga manifest booking.journal   # print the InterventionManifest beside a dead-lettered journal
+saga graph    booking.journal   # mermaid flowchart, each step annotated with its final state
+```
+
+All five are read-only and share the same pure `replay.fold` the engine and
+recovery use, so what the CLI shows is exactly what recovery would act on.
+
 ## Edge cases the design handles explicitly
 
 - **Zombie steps** (crash or cancellation mid-effect) — resolved via the
@@ -226,16 +314,22 @@ reconstructing a state machine that never legally existed.
 ```bash
 pip install -e ".[dev]"
 python -m pytest -q
+
+python examples/booking_saga.py    # watch a full rollback; the journal reads by eye
+python examples/poison_pill.py     # watch a DEAD_LETTER + manifest
 ```
 
-Once the journal lands (Phase 2+), the load-bearing test is the crash-
-injection sweep: `SAGA_CRASH_AT_LSN=<n>` makes the journal writer call
-`os._exit(1)` immediately after fsyncing LSN `n`. The suite runs an example
-saga in a subprocess for every `n` from 1 to the final LSN, recovers it in
-the parent, and asserts no double execution, no orphaned side effects,
-guaranteed termination, and that the recovered snapshot exactly equals
-`replay.fold(all_records)`. Because the engine is a pure fold over an
-append-only log, this sweep is exhaustive over crash points, not a sample.
+The load-bearing test is the crash-injection sweep in
+[`tests/test_crash_sweep.py`](tests/test_crash_sweep.py):
+`SAGA_CRASH_AT_LSN=<n>` makes the journal writer call `os._exit(1)` the
+instant it has fsynced LSN `n`. The suite runs `examples/booking_saga.py` in
+a subprocess for every `n` from 1 to the final LSN, calls `recover()` in the
+parent, and asserts — for every `n` — no double execution (handlers append to
+a side-ledger; the attempt counter never advances on recovery), no orphaned
+side effects, guaranteed termination, inverse-order compensation, and that
+the recovered snapshot exactly equals `replay.fold(all_records)`. Because the
+engine is a pure fold over an append-only log, this sweep is exhaustive over
+crash points, not a sample.
 
 ## License
 

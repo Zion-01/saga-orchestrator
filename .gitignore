@@ -10,6 +10,8 @@ dist/
 .venv/
 venv/
 *.jsonl
+*.journal
+*.journal.lock
 *.manifest.json
 .coverage
 htmlcov/

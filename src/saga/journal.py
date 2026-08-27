@@ -22,6 +22,14 @@ from typing import Any
 from .lockfile import FileLock
 from .records import JournalRecord, RecordType
 
+#: When this environment variable is set to an integer *n*, the writer calls
+#: ``os._exit(1)`` the instant it has fsync'd the record whose ``lsn == n`` --
+#: before that record is returned, before the in-memory snapshot is mutated,
+#: before any handler runs. It is the lever the crash-injection sweep
+#: (``tests/test_crash_sweep.py``) pulls to kill the process at every LSN in
+#: turn and prove recovery from each. It is read once, at ``open_for_write``.
+CRASH_AT_LSN_ENV = "SAGA_CRASH_AT_LSN"
+
 #: O_BINARY only exists on Windows; without it os.open() would open the file
 #: in text mode there and silently translate "\n" -> "\r\n" on write, which
 #: would corrupt the byte-for-byte framing the reader relies on.
@@ -79,6 +87,7 @@ class Journal:
     _lock: FileLock
     _next_lsn: int
     _closed: bool = field(default=False, init=False)
+    _crash_at_lsn: int | None = field(default=None, init=False)
 
     @classmethod
     def open_for_write(cls, path: Path) -> Journal:
@@ -93,13 +102,16 @@ class Journal:
         except BaseException:
             lock.release()
             raise
-        return cls(
+        journal = cls(
             path=path,
             epoch=(last.epoch if last else 0) + 1,
             _fd=fd,
             _lock=lock,
             _next_lsn=(last.lsn if last else 0) + 1,
         )
+        crash_at = os.environ.get(CRASH_AT_LSN_ENV)
+        journal._crash_at_lsn = int(crash_at) if crash_at else None
+        return journal
 
     @property
     def next_lsn(self) -> int:
@@ -129,6 +141,10 @@ class Journal:
         line = (record.encode() + "\n").encode("utf-8")  # encode() raises before any I/O below
         os.write(self._fd, line)
         os.fsync(self._fd)
+        if self._crash_at_lsn is not None and record.lsn == self._crash_at_lsn:
+            # The record is durable; nothing downstream of this point has run.
+            # This is the exact shape a real crash leaves on disk.
+            os._exit(1)
         self._next_lsn += 1
         return record
 

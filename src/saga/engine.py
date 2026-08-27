@@ -73,12 +73,15 @@ from .errors import StepFailure, WorkflowFailed
 from .idempotency import compensation_key, idempotency_key
 from .journal import Journal
 from .manifest import FailedCompensation, InterventionManifest, write_manifest
-from .models import Step, StepContext, WorkflowSnapshot, WorkflowSpec
+from .models import ProbeStatus, Step, StepContext, WorkflowSnapshot, WorkflowSpec
 from .records import RecordType
-from .retry import Disposition, classify as _default_classify
-from .states import StepState, WorkflowState
+from .retry import DEFAULT_PROBE_RETRY, Disposition, RetryPolicy, classify as _default_classify
+from .states import TERMINAL_WORKFLOW_STATES, StepState, WorkflowState
 
-_ROLLBACK_STATES = (StepState.COMPLETED, StepState.UNCERTAIN)
+#: Step states a rollback pass can act on. ``COMPENSATING`` is here for
+#: recovery: a step whose compensator was caught in flight by a crash folds
+#: back to ``COMPENSATING`` and its rollback must be resumed, not skipped.
+_ROLLBACK_STATES = (StepState.COMPLETED, StepState.UNCERTAIN, StepState.COMPENSATING)
 
 
 class Orchestrator:
@@ -100,6 +103,9 @@ class Orchestrator:
         cancel_grace_s: float = 5.0,
         parallel_compensation: bool = False,
         classifier: Callable[[BaseException], Disposition] = _default_classify,
+        probe_retry: RetryPolicy = DEFAULT_PROBE_RETRY,
+        _resume_snapshot: WorkflowSnapshot | None = None,
+        _resume_incident_lsn: int | None = None,
     ) -> None:
         self._spec = spec
         self._journal = journal
@@ -107,12 +113,25 @@ class Orchestrator:
         self._cancel_grace_s = cancel_grace_s
         self._parallel_compensation = parallel_compensation
         self._classify = classifier
-        self._snapshot: WorkflowSnapshot | None = None
+        self._probe_retry = probe_retry
+        self._snapshot: WorkflowSnapshot | None = _resume_snapshot
+        self._resume = _resume_snapshot is not None
+        self._resume_incident_lsn = _resume_incident_lsn
         self._completion_events: dict[str, asyncio.Event] = {}
         self._abandoned: list[asyncio.Task[Any]] = []
         self._forward_failure: StepFailure | None = None
+        #: recovery opens its own journal and is responsible for closing it.
+        self._owns_journal = False
         #: set once a DEAD_LETTER manifest has been written, for callers/tests.
         self.manifest: InterventionManifest | None = None
+
+    def close(self) -> None:
+        """Release the journal, but only if this orchestrator opened it --
+        i.e. it came from :func:`saga.recovery.recover`. A caller that passed
+        an open :class:`~saga.journal.Journal` in still owns it.
+        """
+        if self._owns_journal:
+            self._journal.close()
 
     @property
     def snapshot(self) -> WorkflowSnapshot:
@@ -126,6 +145,9 @@ class Orchestrator:
     # -- lifecycle ----------------------------------------------------------
 
     async def run(self) -> WorkflowSnapshot:
+        if self._resume:
+            return await self._resume_run()
+
         step_ids = sorted(self._spec.steps)
         record = self._journal.append(
             type=RecordType.WORKFLOW_STARTED,
@@ -169,13 +191,183 @@ class Orchestrator:
         await asyncio.gather(*self._abandoned, return_exceptions=True)
         self._abandoned = []
 
+    # -- recovery (phase 5) ---------------------------------------------------
+
+    async def _resume_run(self) -> WorkflowSnapshot:
+        """Continue a workflow from the state its journal folds to.
+
+        The snapshot is already in ``self._snapshot`` (built by
+        :func:`saga.recovery.recover` from the folded journal). This method
+        appends ``RECOVERY_STARTED``, walks the zombie ladder for every
+        in-flight step, then either resumes the forward DAG or resumes
+        rollback -- never both from scratch. It does not raise
+        ``WorkflowFailed``; the returned snapshot's ``status`` is the outcome.
+        """
+        snap = self.snapshot
+        self._completion_events = {sid: asyncio.Event() for sid in self._spec.steps}
+        for sid, runtime in snap.steps.items():
+            if runtime.state is StepState.COMPLETED:
+                self._completion_events[sid].set()
+
+        if snap.status in TERMINAL_WORKFLOW_STATES:
+            return snap  # nothing to recover
+
+        self._journal_apply(RecordType.RECOVERY_STARTED)
+
+        resume_rollback = snap.status is WorkflowState.COMPENSATING
+        needs_rollback = resume_rollback or snap.status is WorkflowState.CANCELLING
+        rearm: dict[str, int] = {}
+
+        if not resume_rollback:
+            # A step still RUNNING in the folded snapshot is a zombie by
+            # construction: its STEP_STARTED is durable, its effect may have
+            # landed, nothing terminal followed. Promote it to UNCERTAIN.
+            for sid in sorted(snap.steps):
+                if snap.steps[sid].state is StepState.RUNNING:
+                    self._journal_apply(
+                        RecordType.STEP_UNCERTAIN,
+                        step_id=sid,
+                        payload={"reason": f"in flight when epoch {snap.epoch - 1} ended"},
+                    )
+            # Now resolve every UNCERTAIN / CANCELLED step through the ladder.
+            for sid in sorted(snap.steps):
+                state = snap.steps[sid].state
+                if state is StepState.CANCELLED:
+                    self._journal_apply(
+                        RecordType.STEP_UNCERTAIN,
+                        step_id=sid,
+                        payload={"reason": snap.steps[sid].uncertain_reason or "cancelled in flight"},
+                    )
+                    state = StepState.UNCERTAIN
+                if state is StepState.UNCERTAIN:
+                    outcome = await self._resolve_zombie(sid)
+                    if outcome == "rerun":
+                        rearm[sid] = snap.steps[sid].attempt or 1
+                    elif outcome == "rollback":
+                        needs_rollback = True
+            if any(rt.state is StepState.FAILED for rt in snap.steps.values()):
+                needs_rollback = True
+
+        if needs_rollback:
+            await self._compensate(resume=resume_rollback)
+            return self.snapshot
+
+        await self._resume_forward(rearm)
+        if self._forward_failure is not None or any(
+            rt.state is StepState.FAILED for rt in self.snapshot.steps.values()
+        ):
+            await self._compensate(resume=False)
+            return self.snapshot
+
+        if self.snapshot.status is WorkflowState.RUNNING:
+            self._journal_apply(RecordType.WORKFLOW_COMPLETED)
+        return self.snapshot
+
+    async def _resume_forward(self, rearm: dict[str, int]) -> None:
+        """Re-enter the forward TaskGroup for the steps that never finished.
+
+        ``rearm`` maps a step id to the attempt number its replay must reuse
+        (a probe said NOT_FOUND, or there was no probe). ``RETRYING`` steps
+        continue at the next attempt; ``PENDING`` steps start normally.
+        """
+        snap = self.snapshot
+        schedulable = sorted(
+            {sid for sid, rt in snap.steps.items()
+             if rt.state in (StepState.PENDING, StepState.RETRYING)}
+            | set(rearm)
+        )
+        if not schedulable:
+            return
+
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for sid in schedulable:
+                    step = self._spec.steps[sid]
+                    runtime = snap.steps[sid]
+                    if sid in rearm:
+                        start_attempt = rearm[sid]
+                    elif runtime.state is StepState.RETRYING:
+                        start_attempt = runtime.attempt + 1
+                    else:
+                        start_attempt = 1
+                    tg.create_task(
+                        self._run_step(step, start_attempt=start_attempt), name=sid
+                    )
+        except* StepFailure as eg:
+            self._forward_failure = min(eg.exceptions, key=lambda e: e.step_id)
+        finally:
+            await self._drain_abandoned()
+
+    async def _resolve_zombie(self, step_id: str) -> str:
+        """Walk the CLAUDE.md 4.1 ladder for one UNCERTAIN step. Returns one
+        of ``"completed"`` (probe adopted the remote's result), ``"rerun"``
+        (replay the handler with the identical key), or ``"rollback"``
+        (unresolvable -- treat as possibly-completed and route to rollback).
+        """
+        step = self._spec.steps[step_id]
+        runtime = self.snapshot.steps[step_id]
+        key = runtime.idempotency_key or idempotency_key(
+            self.workflow_id, step_id, runtime.attempt or 1
+        )
+
+        if step.probe is None:
+            return "rerun"  # at-least-once delivery + a stable dedup key
+
+        outcome = await self._run_probe(step, key)
+        resolution = "UNKNOWN" if outcome is None else outcome.status.value
+        self._journal_apply(
+            RecordType.STEP_PROBE_RESOLVED, step_id=step_id, payload={"resolution": resolution}
+        )
+        if outcome is None or outcome.status is ProbeStatus.UNKNOWN:
+            return "rollback"
+        if outcome.status is ProbeStatus.NOT_FOUND:
+            return "rerun"
+
+        record = self._journal.append(
+            type=RecordType.STEP_COMPLETED,
+            workflow_id=self.workflow_id,
+            step_id=step_id,
+            payload={"result": outcome.result},
+        )
+        replay.apply(self.snapshot, record)
+        self._completion_events[step_id].set()
+        return "completed"
+
+    async def _run_probe(self, step: Step, key: str):
+        """Call ``step.probe(key)`` with its own bounded retry budget. Returns
+        the :class:`~saga.models.ProbeResult`, or ``None`` if the probe kept
+        failing / stayed UNKNOWN until the budget ran out.
+        """
+        policy = self._probe_retry
+        start = time.monotonic()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = await step.probe(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a failing probe is itself "unknown"
+                if not policy.exhausted(attempt, time.monotonic() - start):
+                    await asyncio.sleep(policy.delay_for(attempt))
+                    continue
+                return None
+            if result is None:
+                return None
+            if result.status is ProbeStatus.UNKNOWN and not policy.exhausted(
+                attempt, time.monotonic() - start
+            ):
+                await asyncio.sleep(policy.delay_for(attempt))
+                continue
+            return result
+
     # -- forward path -----------------------------------------------------
 
-    async def _run_step(self, step: Step) -> None:
+    async def _run_step(self, step: Step, *, start_attempt: int = 1) -> None:
         for dep_id in sorted(step.depends_on):
             await self._completion_events[dep_id].wait()
 
-        attempt = 0
+        attempt = start_attempt - 1
         start = time.monotonic()
 
         while True:
@@ -331,9 +523,14 @@ class Orchestrator:
 
     # -- compensation ----------------------------------------------------
 
-    async def _compensate(self) -> None:
-        comp_record = self._journal_apply(RecordType.WORKFLOW_COMPENSATING)
-        incident_start = comp_record.lsn
+    async def _compensate(self, *, resume: bool = False) -> None:
+        if resume:
+            # The workflow is already COMPENSATING on disk -- re-journaling it
+            # would be an illegal self-transition. Pick up where rollback died.
+            incident_start = self._resume_incident_lsn or self._journal.next_lsn
+        else:
+            comp_record = self._journal_apply(RecordType.WORKFLOW_COMPENSATING)
+            incident_start = comp_record.lsn
 
         # 1. A cancelled in-flight step is a zombie: promote it to UNCERTAIN.
         for step_id in sorted(self.snapshot.steps):
@@ -375,7 +572,18 @@ class Orchestrator:
 
             if runnable:
                 results = await asyncio.gather(
-                    *(self._run_compensation(step, self.snapshot.steps[sid]) for sid, step in runnable)
+                    *(
+                        self._run_compensation(
+                            step,
+                            self.snapshot.steps[sid],
+                            start_attempt=(
+                                self.snapshot.steps[sid].compensation_attempt or 1
+                                if self.snapshot.steps[sid].state is StepState.COMPENSATING
+                                else 1
+                            ),
+                        )
+                        for sid, step in runnable
+                    )
                 )
                 for (sid, _step), (ok, failure) in zip(runnable, results):
                     if not ok and failure is not None:
@@ -473,14 +681,19 @@ class Orchestrator:
         return step_id, step
 
     async def _run_compensation(
-        self, step: Step, runtime: Any
+        self, step: Step, runtime: Any, *, start_attempt: int = 1
     ) -> tuple[bool, FailedCompensation | None]:
         """Bounded, classified compensation loop for one step. Never raises for
         an ordinary compensator error -- returns ``(False, FailedCompensation)``.
+
+        ``start_attempt`` > 1 resumes a compensator that a crash caught in
+        flight: the step folded back to ``COMPENSATING`` and its rollback
+        continues under the same attempt number (a stable key), never a fresh
+        one -- the same invariant the forward path holds.
         """
         policy = step.compensation_retry
         start = time.monotonic()
-        attempt = 0
+        attempt = start_attempt - 1
         forward_result = runtime.result
 
         while True:
