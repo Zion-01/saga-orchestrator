@@ -23,7 +23,7 @@ COMPENSATION_COMPLETED     {}
 COMPENSATION_FAILED        {"error": str, "status_code": int | None}
 WORKFLOW_COMPLETED         {}
 WORKFLOW_COMPENSATED       {}
-WORKFLOW_DEAD_LETTER       {}
+WORKFLOW_DEAD_LETTER       {"manifest": str}   (basename of the InterventionManifest)
 =========================  =========================================
 
 The top-level ``attempt`` field is contextual: for forward-path record types

@@ -104,6 +104,10 @@ def _step_started(snapshot: WorkflowSnapshot, record: JournalRecord) -> None:
     if record.attempt is not None:
         runtime.attempt = record.attempt
     runtime.idempotency_key = record.idempotency_key
+    # The LSN a step most recently *started* at. For a step that never reaches
+    # STEP_COMPLETED (e.g. cancelled in flight -> UNCERTAIN), this is the only
+    # ordering key rollback has -- see engine._compensate.
+    runtime.started_lsn = record.lsn
 
 
 def _step_completed(snapshot: WorkflowSnapshot, record: JournalRecord) -> None:

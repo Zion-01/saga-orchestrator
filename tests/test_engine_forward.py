@@ -221,7 +221,7 @@ async def test_permanent_failure_does_not_retry(journal_path) -> None:
 # --- uncertain outcomes -------------------------------------------------------------
 
 
-async def test_uncertain_outcome_journals_step_uncertain_and_stops(journal_path) -> None:
+async def test_uncertain_outcome_journals_step_uncertain(journal_path) -> None:
     async def maybe_charged(ctx: StepContext):
         raise UncertainOutcome("connection dropped mid-request")
 
@@ -232,13 +232,15 @@ async def test_uncertain_outcome_journals_step_uncertain_and_stops(journal_path)
         with pytest.raises(WorkflowFailed):
             await orchestrator.run()
 
-    assert orchestrator.snapshot.steps["a"].state is StepState.UNCERTAIN
-    assert orchestrator.snapshot.steps["a"].uncertain_reason == "connection dropped mid-request"
     records = read_journal(journal_path).records
-    assert [r.type for r in records if r.step_id == "a"] == [
-        RecordType.STEP_STARTED,
-        RecordType.STEP_UNCERTAIN,
-    ]
+    a_types = [r.type for r in records if r.step_id == "a"]
+    assert a_types[:2] == [RecordType.STEP_STARTED, RecordType.STEP_UNCERTAIN]
+    uncertain = next(r for r in records if r.step_id == "a" and r.type is RecordType.STEP_UNCERTAIN)
+    assert uncertain.payload["reason"] == "connection dropped mid-request"
+    # Phase 4: an UNCERTAIN step with no compensator and no probe cannot be
+    # resolved -> DEAD_LETTER rather than being left dangling.
+    assert orchestrator.snapshot.steps["a"].state is StepState.COMPENSATION_FAILED
+    assert orchestrator.snapshot.status is WorkflowState.DEAD_LETTER
     assert fold(records) == orchestrator.snapshot
 
 
@@ -253,13 +255,12 @@ async def test_engine_timeout_is_treated_as_uncertain_not_retried(journal_path) 
         with pytest.raises(WorkflowFailed):
             await orchestrator.run()
 
-    assert orchestrator.snapshot.steps["a"].state is StepState.UNCERTAIN
     assert "0.02" in orchestrator.snapshot.steps["a"].uncertain_reason
     records = read_journal(journal_path).records
-    assert [r.type for r in records if r.step_id == "a"] == [
-        RecordType.STEP_STARTED,
-        RecordType.STEP_UNCERTAIN,
-    ]
+    a_types = [r.type for r in records if r.step_id == "a"]
+    assert a_types[:2] == [RecordType.STEP_STARTED, RecordType.STEP_UNCERTAIN]
+    assert RecordType.STEP_FAILED not in a_types  # a timeout is never retried
+    assert orchestrator.snapshot.status is WorkflowState.DEAD_LETTER
 
 
 async def test_handler_raised_timeout_error_is_uncertain_even_without_timeout_s(journal_path) -> None:
@@ -273,14 +274,16 @@ async def test_handler_raised_timeout_error_is_uncertain_even_without_timeout_s(
         with pytest.raises(WorkflowFailed):
             await orchestrator.run()
 
-    assert orchestrator.snapshot.steps["a"].state is StepState.UNCERTAIN
     assert orchestrator.snapshot.steps["a"].uncertain_reason == "downstream was slow"
+    records = read_journal(journal_path).records
+    a_types = [r.type for r in records if r.step_id == "a"]
+    assert a_types[:2] == [RecordType.STEP_STARTED, RecordType.STEP_UNCERTAIN]
 
 
-# --- a failed sibling cancels an in-flight one, leaving a zombie shape ------------
+# --- a failed sibling cancels an in-flight one -----------------------------------
 
 
-async def test_sibling_failure_cancels_in_flight_step_leaving_a_dangling_start(journal_path) -> None:
+async def test_sibling_failure_cancels_in_flight_step_and_journals_the_cancel(journal_path) -> None:
     async def fails_fast(ctx: StepContext):
         raise PermanentError("boom")
 
@@ -299,7 +302,14 @@ async def test_sibling_failure_cancels_in_flight_step_leaving_a_dangling_start(j
             await orchestrator.run()
 
     assert started.is_set()
-    assert orchestrator.snapshot.steps["slow"].state is StepState.RUNNING  # never got a terminal record
     records = read_journal(journal_path).records
-    slow_records = [r for r in records if r.step_id == "slow"]
-    assert [r.type for r in slow_records] == [RecordType.STEP_STARTED]  # zombie: intent, no terminus
+    slow_types = [r.type for r in records if r.step_id == "slow"]
+    # Phase 4: the cancellation is journaled, and the step -- possibly a zombie
+    # -- is promoted to UNCERTAIN. With no compensator it dead-letters.
+    assert slow_types[:3] == [
+        RecordType.STEP_STARTED,
+        RecordType.STEP_CANCELLED,
+        RecordType.STEP_UNCERTAIN,
+    ]
+    assert orchestrator.snapshot.status is WorkflowState.DEAD_LETTER
+    assert fold(records) == orchestrator.snapshot

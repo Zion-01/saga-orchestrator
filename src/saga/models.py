@@ -141,6 +141,7 @@ class StepRuntime:
     idempotency_key: str | None = None
     result: Any = None
     last_error: str | None = None
+    started_lsn: int | None = None
     completion_lsn: int | None = None
     uncertain_reason: str | None = None
 
