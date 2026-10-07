@@ -333,4 +333,4 @@ crash points, not a sample.
 
 ## License
 
-No license has been chosen yet.
+[MIT](LICENSE)
