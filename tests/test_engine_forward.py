@@ -95,17 +95,16 @@ async def test_diamond_dag_completes_with_correct_results(journal_path) -> None:
 
 async def test_diamond_independent_branches_run_concurrently(journal_path) -> None:
     spans: dict[str, tuple[float, float]] = {}
-    started = time.monotonic()
     await _run(journal_path, _diamond_spec(record_span=spans))
-    elapsed = time.monotonic() - started
 
-    # b and c each sleep 0.1s; run serially that's >=0.2s, concurrently ~0.1s.
-    # The overlap check below is the real proof of concurrency; this bound
-    # just needs enough headroom over fsync/scheduler jitter to stay well
-    # under the serial time without being tight enough to flake.
-    assert elapsed < 0.18
     b_start, b_end = spans["b"]
     c_start, c_end = spans["c"]
+    # b and c each sleep 0.1s; run serially their combined window is >=0.2s,
+    # concurrently ~0.1s. Measure only that window, not the whole run, so the
+    # journal fsyncs for a and d (slow on some CI filesystems) don't count.
+    # The overlap check below is the real proof of concurrency.
+    window = max(b_end, c_end) - min(b_start, c_start)
+    assert window < 0.18
     assert b_start < c_end and c_start < b_end  # the two sleeps overlap in time
 
 
